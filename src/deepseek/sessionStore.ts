@@ -19,6 +19,8 @@ export interface SessionEntry {
   toolsFingerprint?: string;
   updatedAt: number;
   turns: MessageTurn[];
+  turnCount?: number;
+  totalChars?: number;
 }
 export interface ConversationResolution {
   sessionId: string | null;
@@ -26,6 +28,7 @@ export interface ConversationResolution {
   key: string | null;
   pendingFingerprint?: string;
   createIfMissing?: boolean;
+  rolloverContext?: MessageTurn[];
 }
 interface SessionDisk {
   sessions: Record<string, SessionEntry>;
@@ -70,12 +73,18 @@ function parseSessionEntry(value: unknown): SessionEntry | null {
     lastResponseMessageId,
     updatedAt: value.updatedAt,
     turns,
+    ...(typeof value.turnCount === 'number' ? { turnCount: value.turnCount } : {}),
+    ...(typeof value.totalChars === 'number' ? { totalChars: value.totalChars } : {}),
     ...(lastModelType ? { lastModelType } : {}),
     ...(modelType ? { modelType } : {}),
     ...(instructionFingerprint ? { instructionFingerprint } : {}),
     ...(toolsFingerprint ? { toolsFingerprint } : {}),
   };
 }
+
+const MAX_SESSION_MESSAGES = 80;
+const MAX_SESSION_CHARS = 80_000;
+const ROLLOVER_CONTEXT_MESSAGES = 12;
 
 /** Public session index used by every completion path. */
 export class SessionStore {
@@ -97,7 +106,7 @@ export class SessionStore {
     return this.sessions.get(sessionId);
   }
 
-  /** Resolve explicit IDs first, then previous response IDs, then history fingerprints. */
+  /** Resolve explicit IDs/history first, then continue the persistent default conversation. */
   resolve(body: RequestBody): ConversationResolution {
     const meta = metadata(body);
     const explicit = stringId(
@@ -119,8 +128,12 @@ export class SessionStore {
     }
 
     const messages = this.requestMessages(body);
-    if (messages && messages.length > 1) return this.resolveHistory(messages);
-    return { sessionId: null, parentMessageId: null, key: null };
+    if (messages && messages.length > 1) {
+      const history = this.resolveHistory(messages);
+      if (history.sessionId || history.rolloverContext) return history;
+      return this.resolveGlobal(history.key, history.pendingFingerprint);
+    }
+    return this.resolveGlobal(null);
   }
 
   /** Save the response message ID required as the next parent_message_id. */
@@ -160,6 +173,13 @@ export class SessionStore {
       ...(toolsFingerprint ? { toolsFingerprint } : {}),
       updatedAt: Date.now(),
       turns: turns.slice(-40),
+      turnCount: (previous?.turnCount ?? previous?.turns.length ?? 0) + requests.length + 1,
+      totalChars:
+        (previous?.totalChars ??
+          previous?.turns.reduce((sum, turn) => sum + turn.content.length, 0) ??
+          0) +
+        requests.reduce((sum, turn) => sum + normalizeText(turn.content).length, 0) +
+        assistantText.length,
     };
     this.sessions.set(input.sessionId, entry);
     if (input.convKey) this.convIndex.set(input.convKey, input.sessionId);
@@ -175,12 +195,54 @@ export class SessionStore {
     fallbackParent: MessageId,
     prefix: "id" | "prev",
   ): ConversationResolution {
-    const entry = this.sessions.get(sessionId);
+    const resolvedId =
+      prefix === "id"
+        ? this.convIndex.get(`id:${sessionId}`) ?? sessionId
+        : sessionId;
+    const entry = this.sessions.get(resolvedId);
+
+    if (entry && this.needsRollover(entry)) {
+      return this.rollover(entry, resolvedId);
+    }
+
     return {
-      sessionId,
+      sessionId: resolvedId,
       parentMessageId: entry?.lastResponseMessageId ?? fallbackParent,
       key: `${prefix}:${sessionId}`,
       ...(!entry ? { createIfMissing: true } : {}),
+    };
+  }
+
+  private resolveGlobal(
+    key: string | null,
+    pendingFingerprint?: string,
+  ): ConversationResolution {
+    // Never attach an unidentified request to another conversation.
+    return {
+      sessionId: null,
+      parentMessageId: null,
+      key,
+      ...(pendingFingerprint ? { pendingFingerprint } : {}),
+    };
+  }
+
+  private needsRollover(entry: SessionEntry): boolean {
+    const messages = entry.turnCount ?? entry.turns.length;
+    const chars = entry.totalChars ?? entry.turns.reduce((sum, turn) => sum + turn.content.length, 0);
+    return messages >= MAX_SESSION_MESSAGES || chars >= MAX_SESSION_CHARS;
+  }
+
+  private rollover(entry: SessionEntry, oldSessionId: string): ConversationResolution {
+    this.logger?.info("Starting a fresh DeepSeek session at the configured safety threshold", {
+      previousSessionId: oldSessionId,
+      turnCount: entry.turnCount ?? entry.turns.length,
+      totalChars: entry.totalChars ?? entry.turns.reduce((sum, turn) => sum + turn.content.length, 0),
+    });
+    return {
+      sessionId: null,
+      parentMessageId: null,
+      key: null,
+      rolloverContext: entry.turns.slice(-ROLLOVER_CONTEXT_MESSAGES),
     };
   }
 
@@ -229,9 +291,11 @@ export class SessionStore {
   }
 
   private found(sessionId: string, key: string): ConversationResolution {
+    const entry = this.sessions.get(sessionId);
+    if (entry && this.needsRollover(entry)) return this.rollover(entry, sessionId);
     return {
       sessionId,
-      parentMessageId: this.sessions.get(sessionId)?.lastResponseMessageId ?? null,
+      parentMessageId: entry?.lastResponseMessageId ?? null,
       key,
     };
   }

@@ -65,6 +65,30 @@ function finalChunk(
   };
 }
 
+const PROTOCOL_MARKERS = [
+  "<tool_call",
+  "<_call",
+  "<｜｜DSML｜｜",
+];
+
+function findProtocolMarker(text: string): number {
+  let first = -1;
+  for (const marker of PROTOCOL_MARKERS) {
+    const index = text.indexOf(marker);
+    if (index >= 0 && (first < 0 || index < first)) first = index;
+  }
+  return first;
+}
+
+function markerPrefixSuffixLength(text: string): number {
+  const maxLength = Math.max(...PROTOCOL_MARKERS.map((marker) => marker.length));
+  for (let length = Math.min(text.length, maxLength - 1); length > 0; length--) {
+    const suffix = text.slice(-length);
+    if (PROTOCOL_MARKERS.some((marker) => marker.startsWith(suffix))) return length;
+  }
+  return 0;
+}
+
 export async function streamPlainChat(
   run: ChatRun,
   emit: (chunk: ChatStreamChunk) => void,
@@ -75,10 +99,24 @@ export async function streamPlainChat(
   let responseMessageId: MessageId = null;
   let roleSent = false;
   let reasoningSent = false;
+  let pendingOutput = "";
+  let visibleText = "";
+  let protocolDetected = false;
+
   const writeDelta = (delta: Record<string, unknown>): void => {
     const withRole = roleSent ? delta : { role: "assistant", ...delta };
     roleSent = true;
     emit(chatChunk(run, created, withRole, null));
+  };
+
+  const writeContent = (text: string): void => {
+    if (!text) return;
+    if (!reasoningSent && reasoningText) {
+      writeDelta({ reasoning_content: reasoningText });
+      reasoningSent = true;
+    }
+    writeDelta({ content: text });
+    visibleText += text;
   };
 
   for await (const update of iterDeepSeekUpdates(run.upstream)) {
@@ -86,19 +124,54 @@ export async function streamPlainChat(
       responseMessageId = update.responseMessageId ?? responseMessageId;
     } else if (update.type === "reasoning" && update.delta) {
       reasoningText += update.delta;
-      if (responseText && reasoningSent) writeDelta({ reasoning_content: update.delta });
+      if (visibleText && reasoningSent) {
+        writeDelta({ reasoning_content: update.delta });
+      }
     } else if (update.type === "output" && update.delta) {
       responseText += update.delta;
-      if (!reasoningSent && reasoningText) {
-        writeDelta({ reasoning_content: reasoningText });
-        reasoningSent = true;
+      if (protocolDetected) continue;
+
+      pendingOutput += update.delta;
+      const markerIndex = findProtocolMarker(pendingOutput);
+
+      if (markerIndex >= 0) {
+        writeContent(pendingOutput.slice(0, markerIndex));
+        protocolDetected = true;
+        pendingOutput = "";
+        continue;
       }
-      writeDelta({ content: update.delta });
+
+      // Retain only a possible marker prefix so split markers cannot leak.
+      const retained = markerPrefixSuffixLength(pendingOutput);
+      const safeLength = pendingOutput.length - retained;
+      writeContent(pendingOutput.slice(0, safeLength));
+      pendingOutput = pendingOutput.slice(safeLength);
     }
   }
 
-  const finalText = responseText.trim() ? responseText : reasoningText;
-  if (!responseText.trim() && reasoningText) writeDelta({ content: reasoningText });
+  if (!protocolDetected && pendingOutput &&
+      !PROTOCOL_MARKERS.some((marker) => marker.startsWith(pendingOutput))) {
+    writeContent(pendingOutput);
+  } else if (!protocolDetected && pendingOutput) {
+    // Do not expose a truncated protocol marker at end of stream.
+    protocolDetected = true;
+  }
+
+  let finalText: string;
+  if (protocolDetected) {
+    const parsed = parseToolCalls(responseText);
+    // A plain-chat request must never expose protocol syntax as assistant prose.
+    if (parsed.toolCalls.length > 0 && parsed.content.startsWith(visibleText)) {
+      writeContent(parsed.content.slice(visibleText.length));
+      finalText = parsed.content;
+    } else {
+      finalText = visibleText;
+    }
+  } else {
+    finalText = responseText.trim() ? responseText : reasoningText;
+    if (!responseText.trim() && reasoningText) writeContent(reasoningText);
+  }
+
   emit(finalChunk(run, created, "stop"));
   return {
     responseMessageId,

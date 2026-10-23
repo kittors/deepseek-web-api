@@ -4,15 +4,19 @@ import { describe, expect, it } from "vitest";
 import {
   consumeToolChat,
   emitToolChat,
+  streamPlainChat,
   type ChatRun,
   type ChatStreamChunk,
 } from "../../src/deepseek/chatStream.js";
 import { EMPTY_TOOL_RESPONSE_TEXT } from "../../src/deepseek/toolOutcome.js";
 
-function upstream(parts: { reasoning?: string; output?: string }): Response {
+function upstream(parts: { reasoning?: string; output?: string | string[] }): Response {
+  const outputs = parts.output
+    ? Array.isArray(parts.output) ? parts.output : [parts.output]
+    : [];
   const fragments = [
     ...(parts.reasoning ? [{ type: "THINK", content: parts.reasoning }] : []),
-    ...(parts.output ? [{ type: "RESPONSE", content: parts.output }] : []),
+    ...outputs.map((content) => ({ type: "RESPONSE", content })),
   ];
   return new Response(
     'event: ready\ndata: {"response_message_id":7}\n\n' +
@@ -31,6 +35,52 @@ function content(chunks: ChatStreamChunk[]): string {
     ),
   ).join("");
 }
+
+describe("plain Chat stream mapping", () => {
+  it("streams ordinary text without changing its content", async () => {
+    const chunks: ChatStreamChunk[] = [];
+    const result = await streamPlainChat(
+      run(upstream({ output: ["Hello ", "world."] })),
+      (chunk) => chunks.push(chunk),
+    );
+
+    expect(content(chunks)).toBe("Hello world.");
+    expect(result.finalText).toBe("Hello world.");
+  });
+
+  it("suppresses a tool marker split across upstream chunks", async () => {
+    const chunks: ChatStreamChunk[] = [];
+    const result = await streamPlainChat(
+      run(upstream({
+        output: [
+          "Here is the result.\n<tool_",
+          'call>\n{"name":"read","arguments":{"path":"a"}}\n</tool_call>',
+        ],
+      })),
+      (chunk) => chunks.push(chunk),
+    );
+
+    expect(content(chunks)).toBe("Here is the result.\n");
+    expect(content(chunks)).not.toContain("<tool_call");
+    expect(result.finalText).not.toContain("<tool_call");
+  });
+
+  it("suppresses a split DSML invoke marker", async () => {
+    const chunks: ChatStreamChunk[] = [];
+    await streamPlainChat(
+      run(upstream({
+        output: [
+          "Working. <｜｜DSML",
+          "｜｜ invoke name=\"shell\"><｜｜parameter name=\"command\">id</｜｜parameter></｜｜DSML｜｜/invoke>",
+        ],
+      })),
+      (chunk) => chunks.push(chunk),
+    );
+
+    expect(content(chunks)).toBe("Working. ");
+    expect(content(chunks)).not.toContain("DSML");
+  });
+});
 
 describe("tool Chat stream mapping", () => {
   it("promotes reasoning-only prose into visible content without duplication", async () => {

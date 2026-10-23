@@ -26,6 +26,37 @@ const FAILED_SESSION_C = `<_call>
 {"name": "read", "arguments": {"path": "/Users/kittors/Developer/opensource/deepseek-web-api/src/deepseek/completion.ts"}
 </tool_call>`;
 
+
+describe("DeepSeek DSML tool calls", () => {
+  it("parses DSML invoke calls with a file path and content", () => {
+    const text = `<｜｜DSML｜｜ invoke name="write">
+<｜｜DSML｜｜parameter name="filePath">/home/ubuntu/test.txt</｜｜DSML｜｜parameter>
+<｜｜DSML｜｜parameter name="content">Hello from opencode!</｜｜DSML｜｜parameter>
+<｜｜DSML｜｜/invoke>`;
+    const result = parseToolCalls(text, "dsml-write");
+
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("write");
+    expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({
+      filePath: "/home/ubuntu/test.txt",
+      content: "Hello from opencode!",
+    });
+    expect(result.content).toBe("");
+  });
+
+  it("parses DSML shell calls", () => {
+    const text = `<｜｜DSML｜｜ invoke name="shell">
+<｜｜DSML｜｜parameter name="command">printf 'TOOL_OK\\\\n'; whoami</｜｜DSML｜｜parameter>
+<｜｜DSML｜｜/invoke>`;
+    const result = parseToolCalls(text, "dsml-shell");
+
+    expect(result.toolCalls[0]?.function.name).toBe("shell");
+    expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({
+      command: "printf 'TOOL_OK\\\\n'; whoami",
+    });
+  });
+});
+
 describe("parseToolCalls", () => {
   it("maps tagged JSON to OpenAI tool_calls while preserving normal content", () => {
     const result = parseToolCalls(

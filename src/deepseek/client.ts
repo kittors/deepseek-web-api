@@ -162,9 +162,16 @@ export class DeepSeekClient {
     const built = retryFrom
       ? null
       : buildDeepSeekPrompt(body, { reusedSession, ...(previous ? { previous } : {}) });
-    const prompt = retryFrom
+    const basePrompt = retryFrom
       ? buildToolRecoveryPrompt(body, retryFrom.requestTurns, retryFrom.latestUserText).trim()
       : built?.prompt.trim() ?? "";
+    const rolloverContext =
+      !retryFrom && conversation?.rolloverContext?.length && (built?.requestTurns.length ?? 0) <= 1
+        ? `\n\n[Context from the previous DeepSeek session]\n${conversation.rolloverContext
+            .map((turn) => `${turn.role}:\n${turn.content}`)
+            .join("\n\n")}\n\nContinue the conversation using this context where relevant.`
+        : "";
+    const prompt = `${basePrompt}${rolloverContext}`.trim();
     if (!prompt) throw new HttpError(400, "empty input");
 
     const auth = await this.login.dumpCurrent();

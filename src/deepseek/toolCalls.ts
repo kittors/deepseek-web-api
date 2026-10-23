@@ -192,8 +192,39 @@ function taggedCandidates(text: string, blocks: readonly TagBlock[]): {
   return { calls, artifacts };
 }
 
+
+/** Normalize DeepSeek DSML invoke blocks into the existing tool-call protocol. */
+function normalizeDsmlToolCalls(text: string): string {
+  const invokePattern =
+    /<｜｜DSML｜｜\s*invoke\b([^>]*)>([\s\S]*?)(?:<｜｜DSML｜｜\s*\/invoke\s*>|$)/gi;
+
+  return text.replace(invokePattern, (block, attributes: string, body: string) => {
+    const name = attributeName(attributes);
+    if (!name) return block;
+
+    const args: Record<string, unknown> = {};
+    const parameterPattern =
+      /<｜｜DSML｜｜\s*parameter\b([^>]*)>([\s\S]*?)<\/｜｜DSML｜｜\s*parameter\s*>/gi;
+
+    let match: RegExpExecArray | null;
+    let count = 0;
+
+    while ((match = parameterPattern.exec(body)) !== null) {
+      const key = attributeName(match[1] ?? "");
+      if (!key) continue;
+
+      args[key] = (match[2] ?? "").replace(/^\r?\n|\r?\n$/g, "");
+      count += 1;
+    }
+
+    if (count === 0) return block;
+    return formatToolCall(name, args) ?? block;
+  });
+}
+
 /** Parse model tool-call text into OpenAI-compatible calls and cleaned content. */
 export function parseToolCalls(text: string, seed = "tool"): ParsedToolCalls {
+  text = normalizeDsmlToolCalls(text);
   const blocks = tagBlocks(text);
   const tagged = taggedCandidates(text, blocks);
   const bareObjects = collectJsonObjects(text).filter(

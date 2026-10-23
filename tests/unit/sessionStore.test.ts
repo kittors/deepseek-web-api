@@ -5,6 +5,40 @@ import { SessionStore } from "../../src/deepseek/sessionStore.js";
 import { canonicalAssistantText } from "../../src/deepseek/toolCalls.js";
 
 describe("SessionStore", () => {
+
+  it("does not attach an unidentified new message to the latest session", () => {
+    const store = new SessionStore();
+    store.remember({
+      sessionId: "global-session",
+      modelType: "default",
+      responseMessageId: 10,
+      prompt: "hello",
+      responseText: "world",
+    });
+
+    expect(store.resolve({ messages: [{ role: "user", content: "continue" }] }))
+      .toMatchObject({ sessionId: null, parentMessageId: null });
+  });
+
+  it("rolls over a long session and preserves recent context", () => {
+    const store = new SessionStore();
+    for (let index = 0; index < 40; index += 1) {
+      store.remember({
+        sessionId: "long-global-session",
+        modelType: "default",
+        responseMessageId: index + 1,
+        prompt: `request-${index}`,
+        responseText: `answer-${index}`,
+        requestTurns: [{ role: "user", content: `request-${index}` }],
+      });
+    }
+
+    const result = store.resolve({ conversation: "long-global-session" });
+    expect(result.sessionId).toBeNull();
+    expect(result.rolloverContext).toHaveLength(12);
+    expect(result.rolloverContext?.at(-1)?.content).toBe("answer-39");
+  });
+
   it("does not persist or advance a session for an empty assistant response", () => {
     const store = new SessionStore();
     store.remember({
